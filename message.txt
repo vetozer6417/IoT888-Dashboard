@@ -1,0 +1,184 @@
+import requests
+import time
+import threading
+from datetime import datetime
+import lgpio
+
+# ---------------- GPIO setup ----------------
+SWITCH_PIN = 18   # Toggle button
+BUZZER_PIN = 12   # Buzzer
+
+# Open GPIO chip
+h = lgpio.gpiochip_open(0)
+lgpio.gpio_claim_input(h, SWITCH_PIN)   # Button input
+lgpio.gpio_claim_output(h, BUZZER_PIN)  # Buzzer output
+
+# ---------------- ESP32 configuration ----------------
+ESP32_IP = "172.20.10.3"
+ESP32_URL = f"http://{ESP32_IP}/data"
+
+# ---------------- Firebase configuration ----------------
+FIREBASE_URL = "https://iot888-chula-default-rtdb.asia-southeast1.firebasedatabase.app"
+DEVICE_ID = "elderlyDevice1"
+
+# ---------------- Gyro threshold ----------------
+GYRO_THRESHOLD = 1000  # adjust sensitivity
+
+
+class MonitoringSystem:
+    def __init__(self):
+        self.buzzer_enabled = False
+        self.buzzer_active = False
+        self.stop_siren = threading.Event()
+        self.lock = threading.Lock()
+        self.running = True
+
+        # Last gyro reading
+        self.last_gyro = None
+
+        # Start toggle button watcher
+        threading.Thread(target=self.switch_watcher, daemon=True).start()
+        # Start ESP32 polling thread
+        threading.Thread(target=self.esp32_poller, daemon=True).start()
+
+    def get_current_timestamp(self):
+        return datetime.utcnow().isoformat() + "Z"
+
+    # ---------------- Toggle switch handling ----------------
+    def switch_watcher(self):
+        """Toggle siren on/off when button pressed"""
+        last_state = 1
+        while self.running:
+            current_state = lgpio.gpio_read(h, SWITCH_PIN)
+            if last_state == 1 and current_state == 0:  # falling edge
+                time.sleep(0.05)  # debounce
+                if lgpio.gpio_read(h, SWITCH_PIN) == 0:
+                    with self.lock:
+                        self.buzzer_enabled = not self.buzzer_enabled
+                        if self.buzzer_enabled:
+                            print("🚨 Siren ENABLED")
+                            self.start_siren()
+                        else:
+                            print("🔕 Siren DISABLED")
+                            self.stop_siren.set()
+            last_state = current_state
+            time.sleep(0.01)
+
+    # ---------------- Siren logic ----------------
+    def start_siren(self):
+        def siren_thread():
+            self.buzzer_active = True
+            self.stop_siren.clear()
+            try:
+                while not self.stop_siren.is_set():
+                    for f in range(400, 1000, 20):  # rising pitch
+                        if self.stop_siren.is_set():
+                            break
+                        self.play_tone(f, 0.01)
+                    for f in range(1000, 400, -20):  # falling pitch
+                        if self.stop_siren.is_set():
+                            break
+                        self.play_tone(f, 0.01)
+            finally:
+                lgpio.gpio_write(h, BUZZER_PIN, 0)
+                self.buzzer_active = False
+                print("🔕 Siren stopped")
+
+        if not self.buzzer_active:
+            threading.Thread(target=siren_thread, daemon=True).start()
+
+    def play_tone(self, freq, duration):
+        period = 1.0 / freq
+        half_period = period / 2
+        end_time = time.time() + duration
+        while time.time() < end_time and not self.stop_siren.is_set():
+            lgpio.gpio_write(h, BUZZER_PIN, 1)
+            time.sleep(half_period)
+            lgpio.gpio_write(h, BUZZER_PIN, 0)
+            time.sleep(half_period)
+
+    def beep_once(self, duration=0.2):
+        """Simple short beep"""
+        lgpio.gpio_write(h, BUZZER_PIN, 1)
+        time.sleep(duration)
+        lgpio.gpio_write(h, BUZZER_PIN, 0)
+
+    # ---------------- ESP32 + Firebase ----------------
+    def get_esp32_data(self):
+        try:
+            response = requests.get(ESP32_URL, timeout=2)
+            if response.ok:
+                return response.json()
+        except requests.exceptions.RequestException:
+            pass
+        return None
+
+    def send_to_firebase(self, data):
+        try:
+            current_time = self.get_current_timestamp()
+            with self.lock:
+                data["buzzer"] = {"status": "ON" if self.buzzer_enabled else "OFF", "timestamp": current_time}
+                data["lastUpdated"] = current_time
+
+            url = f"{FIREBASE_URL}/{DEVICE_ID}/history.json"
+            requests.post(url, json=data, timeout=5)
+        except requests.exceptions.RequestException:
+            print("⚠️ Firebase send failed")
+
+    # ---------------- Gyro detection ----------------
+    def check_gyro_change(self, gyro_data):
+        if not self.last_gyro:
+            self.last_gyro = gyro_data
+            return
+
+        dx = abs(gyro_data["gyroX"] - self.last_gyro["gyroX"])
+        dy = abs(gyro_data["gyroY"] - self.last_gyro["gyroY"])
+        dz = abs(gyro_data["gyroZ"] - self.last_gyro["gyroZ"])
+
+        if dx > GYRO_THRESHOLD or dy > GYRO_THRESHOLD or dz > GYRO_THRESHOLD:
+            print(f"⚠️ Dramatic gyro change detected! ΔX={dx:.2f}, ΔY={dy:.2f}, ΔZ={dz:.2f}")
+            # Trigger the siren
+            with self.lock:
+                if not self.buzzer_active:   # only if not already running
+                    self.start_siren()
+
+        self.last_gyro = gyro_data
+
+
+    # ---------------- ESP32 Polling ----------------
+    def esp32_poller(self):
+        while self.running:
+            sensor_data = self.get_esp32_data()
+            if sensor_data:
+                # Print to terminal
+                print(f"[{self.get_current_timestamp()}] ESP32 Data: {sensor_data}")
+
+                # Check for dramatic gyro change
+                if "gyro" in sensor_data:
+                    self.check_gyro_change(sensor_data["gyro"])
+
+                # Send to Firebase
+                self.send_to_firebase(sensor_data)
+
+            time.sleep(0.1)  # poll every 0.1 sec (100ms)
+
+    # ---------------- Main ----------------
+    def run(self):
+        print("📡 Monitoring System Started")
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            print("\n🛑 Shutting down...")
+        finally:
+            self.running = False
+            self.stop_siren.set()
+            lgpio.gpio_write(h, BUZZER_PIN, 0)
+            lgpio.gpiochip_close(h)
+            print("System shutdown complete")
+
+
+if __name__ == "__main__":
+    monitor = MonitoringSystem()
+    monitor.run()
+
